@@ -1,0 +1,912 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import socket
+import time
+import configparser
+import os
+import sys
+from datetime import datetime
+import serial
+import serial.tools.list_ports
+import threading
+import queue
+import logging
+import errno
+import select
+import re
+import unicodedata
+import traceback
+
+class TelnetProtocol:
+    # Telnet コマンド
+    IAC = b'\xff'
+    DONT = b'\xfe'
+    DO = b'\xfd'
+    WONT = b'\xfc'
+    WILL = b'\xfb'
+    SB = b'\xfa'
+    SE = b'\xf0'
+    
+    # Telnet オプション
+    ECHO = b'\x01'
+    SUPPRESS_GO_AHEAD = b'\x03'
+    TERMINAL_TYPE = b'\x18'
+    NAWS = b'\x1f'
+    
+    def __init__(self):
+        self.buffer = bytearray()
+        self.negotiation_done = False
+    
+    def handle_negotiation(self, data):
+        """Telnetネゴシエーションを処理"""
+        response = bytearray()
+        i = 0
+        while i < len(data):
+            if data[i:i+1] == self.IAC:
+                if i + 2 < len(data):
+                    cmd = data[i+1:i+2]
+                    opt = data[i+2:i+3]
+                    if cmd == self.DO:
+                        if opt in [self.ECHO, self.SUPPRESS_GO_AHEAD]:
+                            response.extend(self.IAC + self.WILL + opt)
+                        else:
+                            response.extend(self.IAC + self.WONT + opt)
+                    elif cmd == self.WILL:
+                        if opt in [self.ECHO, self.SUPPRESS_GO_AHEAD]:
+                            response.extend(self.IAC + self.DO + opt)
+                        else:
+                            response.extend(self.IAC + self.DONT + opt)
+                    i += 3
+                    continue
+            i += 1
+        return response
+
+    def process_data(self, data):
+        """データを処理してTelnetコマンドを除去"""
+        clean_data = bytearray()
+        i = 0
+        while i < len(data):
+            if data[i:i+1] == self.IAC:
+                if i + 2 < len(data):
+                    i += 3  # IAC + cmd + opt をスキップ
+                else:
+                    i += 1
+            else:
+                clean_data.append(data[i])
+                i += 1
+        return bytes(clean_data)
+
+class TCPSerialCommandSender:
+
+    """Initialization and Settings"""
+    def __init__(self, root):  # 初期化関数
+        self.root = root
+        self.root.title("TCP/IP・シリアルコマンド送信ツール")
+        
+        # 接続状態管理
+        self.is_connected = False
+        self.connection = None
+        self.receive_thread = None
+        self.receive_queue = queue.Queue()
+        self.should_stop = threading.Event()
+        self.telnet_protocol = TelnetProtocol()
+        
+        # ロギング設定
+        self.setup_logging()
+        
+        # 実行ファイルのパスを取得
+        if getattr(sys, 'frozen', False):
+            self.app_path = os.path.dirname(sys.executable)
+        else:
+            self.app_path = os.path.dirname(os.path.abspath(__file__))
+        
+        # iniファイルの保存先をユーザーのDocumentsフォルダに変更
+        documents_dir = os.path.join(os.path.expanduser("~"), "Documents")
+        self.ini_path = os.path.join(documents_dir, 'settings.ini')
+        
+        # INIファイルからの設定読み込み
+        self.config = configparser.ConfigParser()
+        self.load_settings()
+        
+        # シリアル設定用の変数を初期化
+        self.baudrate_var = tk.StringVar(value=self.config['SERIAL'].get('baudrate', '9600'))
+        self.bytesize_var = tk.StringVar(value=self.config['SERIAL'].get('bytesize', '8'))
+        self.parity_var = tk.StringVar(value=self.config['SERIAL'].get('parity', 'NONE'))
+        self.stopbits_var = tk.StringVar(value=self.config['SERIAL'].get('stopbits', '1'))
+        self.newline_var = tk.StringVar(value=self.config['SERIAL'].get('newline', 'CRLF'))
+        self.flow_var = tk.StringVar(value=self.config['SERIAL'].get('flow_control', 'NONE'))
+    
+        # GUI作成
+        self.create_gui()
+        
+        # 受信処理のポーリング設定
+        self.root.after(100, self.check_received_data)
+        
+        self.log_file_name = None  # ログファイル名を初期化
+
+    def load_settings(self):  # 設定の読み込み
+        if not os.path.exists(self.ini_path):
+            # デフォルト設定の作成
+            self.config['CONNECTION'] = {
+                'host': '127.0.0.1',
+                'port': '5000',
+                'mode': 'TCP',  # 'TCP' or 'SERIAL'
+                'com_port': 'COM3',
+                'timeout': '5',
+                'encoding': 'utf-8'
+            }
+            
+            self.config['SERIAL'] = {
+                'baudrate': '9600',
+                'bytesize': '8',
+                'parity': 'NONE',
+                'stopbits': '1',
+                'newline': 'CRLF',
+                'flow_control': 'NONE'
+            }
+            
+            self.config['RESPONSE'] = {
+                'wait_time': '1',
+                'max_length': '1024',
+                'format': 'text'
+            }
+            
+            self.config['COMMANDS'] = {}
+            
+            with open(self.ini_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+                
+            messagebox.showinfo("初期設定",
+                              f"設定ファイルを作成しました:\n{self.ini_path}")
+        else:
+            self.config.read(self.ini_path, encoding='utf-8')
+            
+            # 既存の設定ファイルに新しい設定項目がない場合、デフォルト値を追加
+            if 'CONNECTION' not in self.config:
+                self.config['CONNECTION'] = {}
+            
+            # 必要な設定項目がない場合、デフォルト値を設定
+            default_connection = {
+                'host': '127.0.0.1',
+                'port': '5000',
+                'mode': 'TCP',
+                'com_port': 'COM3',
+                'timeout': '5',
+                'encoding': 'utf-8'
+            }
+            
+            for key, value in default_connection.items():
+                if key not in self.config['CONNECTION']:
+                    self.config['CONNECTION'][key] = value
+            
+            # SERIAL セクションのデフォルト値設定
+            if 'SERIAL' not in self.config:
+                self.config['SERIAL'] = {}
+            
+            default_serial = {
+                'baudrate': '9600',
+                'bytesize': '8',
+                'parity': 'NONE',
+                'stopbits': '1',
+                'newline': 'CRLF',
+                'flow_control': 'NONE'
+            }
+            
+            for key, value in default_serial.items():
+                if key not in self.config['SERIAL']:
+                    self.config['SERIAL'][key] = value
+            
+            # 設定を保存
+            with open(self.ini_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+
+    def save_settings(self):  # 設定の保存
+        try:
+            # 現在の設定を保存
+            self.config['CONNECTION']['host'] = self.host_var.get()
+            self.config['CONNECTION']['port'] = self.port_var.get()
+            self.config['CONNECTION']['mode'] = self.mode_var.get()
+            self.config['CONNECTION']['com_port'] = self.com_port_var.get()
+            self.config['SERIAL']['baudrate'] = self.baudrate_var.get()
+            self.config['SERIAL']['bytesize'] = self.bytesize_var.get()
+            self.config['SERIAL']['parity'] = self.parity_var.get()
+            self.config['SERIAL']['stopbits'] = self.stopbits_var.get()
+            self.config['SERIAL']['newline'] = self.newline_var.get()
+            self.config['SERIAL']['flow_control'] = self.flow_var.get()
+            
+            with open(self.ini_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+                
+        except Exception as e:
+            messagebox.showerror("エラー", f"設定の保存に失敗: {str(e)}")
+
+    def open_serial_settings(self):  # シリアル設定のオープン
+        serial_settings_window = tk.Toplevel(self.root)
+        serial_settings_window.title("シリアル通信設定")
+
+        # シリアル通信設定の項目
+        ttk.Label(serial_settings_window, text="通信速度:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        self.baudrate_var = tk.StringVar(value=self.config['SERIAL']['baudrate'])  # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.baudrate_var,
+                    values=['1200', '2400', '4800', '9600', '19200', '38400', '57600', '115200']).grid(
+                    row=0, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(serial_settings_window, text="データビット:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.bytesize_var = tk.StringVar(value=self.config['SERIAL']['bytesize']) # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.bytesize_var,
+                    values=['5', '6', '7', '8']).grid(
+                    row=1, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(serial_settings_window, text="パリティ:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        self.parity_var = tk.StringVar(value=self.config['SERIAL']['parity']) # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.parity_var,
+                    values=['NONE', 'EVEN', 'ODD', 'MARK', 'SPACE']).grid(
+                    row=2, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(serial_settings_window, text="ストップビット:").grid(row=0, column=2, sticky="e", padx=5, pady=2)
+        self.stopbits_var = tk.StringVar(value=self.config['SERIAL']['stopbits']) # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.stopbits_var,
+                    values=['1', '1.5', '2']).grid(
+                    row=0, column=3, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(serial_settings_window, text="改行コード:").grid(row=1, column=2, sticky="e", padx=5, pady=2)
+        self.newline_var = tk.StringVar(value=self.config['SERIAL']['newline']) # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.newline_var,
+                    values=['CR', 'LF', 'CRLF']).grid(
+                    row=1, column=3, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(serial_settings_window, text="フロー制御:").grid(row=2, column=2, sticky="e", padx=5, pady=2)
+        self.flow_var = tk.StringVar(value=self.config['SERIAL']['flow_control']) # クラス属性として設定
+        ttk.Combobox(serial_settings_window, textvariable=self.flow_var,
+                    values=['NONE', 'XON/XOFF', 'RTS/CTS']).grid(
+                    row=2, column=3, sticky="ew", padx=5, pady=2)
+
+        # カラム幅の設定
+        serial_settings_window.grid_columnconfigure(1, weight=1)
+        serial_settings_window.grid_columnconfigure(3, weight=1)
+        
+        # 確定ボタンの追加
+        ttk.Button(serial_settings_window, text="確定", command=lambda: self.save_serial_settings(serial_settings_window)).grid(row=3, column=0, columnspan=4, pady=10)
+
+    def save_serial_settings(self, window):  # シリアル設定の保存
+        try:
+            # 現在の設定を保存
+            self.config['SERIAL']['baudrate'] = self.baudrate_var.get()
+            self.config['SERIAL']['bytesize'] = self.bytesize_var.get()
+            self.config['SERIAL']['parity'] = self.parity_var.get()
+            self.config['SERIAL']['stopbits'] = self.stopbits_var.get()
+            self.config['SERIAL']['newline'] = self.newline_var.get()
+            self.config['SERIAL']['flow_control'] = self.flow_var.get()
+
+            with open(self.ini_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+
+            messagebox.showinfo("情報", "シリアル通信設定を保存しました。")
+            window.destroy()  # 設定保存後にウィンドウを閉じる
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"設定の保存に失敗: {str(e)}")
+
+    """Logging"""
+    def setup_logging(self):  # ロギングのセットアップ
+        # ログディレクトリの作成
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # 初期のログファイル名はNoneに設定
+        self.log_filename = None
+        
+        # コンソールへの出力設定
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        logging.getLogger('').addHandler(console_handler)
+    
+    def open_log_directory(self):  # ログディレクトリのオープン
+        log_dir = "logs"  # デフォルトのログディレクトリ
+        
+        # ディレクトリが存在しない場合は作成
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # ディレクトリを開く
+        os.startfile(log_dir)
+
+    def open_log_file(self):  # ログファイルのオープン
+        if self.log_filename and os.path.exists(self.log_filename):
+            os.startfile(self.log_filename)
+        else:
+            messagebox.showinfo("情報", "ログファイルはまだ作成されていません。")
+
+    def save_log_to_file(self):  # ログをファイルに保存
+        # ログ内容を取得
+        log_content = self.response_text.get("1.0", "end-1c")
+        if not log_content:
+            messagebox.showinfo("情報", "保存するログデータがありません。")
+            return
+
+        # エンコーディングに従ってバイト列に変換
+        encoded_content = log_content.encode(self.config['CONNECTION']['encoding'])
+        self.check_sample_id(encoded_content)
+
+        if not self.log_filename:
+            # Sample ID が見つからなかった場合はデフォルトのファイル名をothersフォルダ内に保存
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            folder_path = os.path.join("logs", "others")
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+            self.log_filename = os.path.join(folder_path, f"communication_{timestamp}.log")
+            messagebox.showinfo("情報", "Sample ID が見つからなかったため、othersフォルダにデフォルトのファイル名で保存します。")
+
+        try:
+            with open(self.log_filename, 'w', encoding='utf-8') as f:
+                f.write(log_content)
+            messagebox.showinfo("保存完了", f"ログを保存しました:\n{self.log_filename}")
+        except Exception as e:
+            messagebox.showerror("エラー", f"ログの保存に失敗しました: {str(e)}")
+
+    """GUI Handling"""
+    def create_gui(self):  # GUIの作成
+        # トップフレーム（通信モードと接続設定を横に配置）
+        top_frame = ttk.Frame(self.root)
+        top_frame.pack(padx=10, pady=5, fill="x")
+
+        # 左側：通信モード選択
+        mode_frame = ttk.LabelFrame(top_frame, text="通信モード", padding=10)
+        mode_frame.pack(side="left", padx=(0, 5), fill="x", expand=True)
+
+        self.mode_var = tk.StringVar(value=self.config['CONNECTION'].get('mode', 'TCP'))
+        ttk.Radiobutton(mode_frame, text="TCP/IP", variable=self.mode_var, 
+                        value="TCP", command=self.update_connection_frame).pack(side="top", padx=5)  # side="top" に変更
+        ttk.Radiobutton(mode_frame, text="シリアル", variable=self.mode_var,
+                        value="SERIAL", command=self.update_connection_frame).pack(side="top", padx=5)  # side="top" に変更
+        # 右側：接続設定フレーム
+        self.conn_frame = ttk.LabelFrame(top_frame, text="接続設定", padding=10)
+        self.conn_frame.pack(side="left", padx=(5, 0), fill="x", expand=True)
+        
+        # 接続設定フレーム
+        self.connection_frame = ttk.Frame(self.root)  # connection_frame を作成
+        self.connection_frame.pack(fill="x", padx=5, pady=5)
+
+        # 接続ボタンフレーム
+        self.connect_frame = ttk.Frame(self.conn_frame)
+        self.connect_frame.pack(fill="x", pady=5)
+        
+        self.connect_button = ttk.Button(self.connect_frame, text="接続", command=self.toggle_connection)
+        self.connect_button.pack(side="left", padx=5)
+        
+        self.connection_status = ttk.Label(self.connect_frame, text="未接続")
+        self.connection_status.pack(side="left", padx=5)
+
+        # TCP/IP設定
+        self.tcp_frame = ttk.Frame(self.conn_frame)
+        ttk.Label(self.tcp_frame, text="ホスト:").grid(row=0, column=0, sticky="e")
+        self.host_var = tk.StringVar(value=self.config['CONNECTION']['host'])
+        ttk.Entry(self.tcp_frame, textvariable=self.host_var).grid(row=0, column=1, padx=5)
+
+        ttk.Label(self.tcp_frame, text="ポート:").grid(row=1, column=0, sticky="e")
+        self.port_var = tk.StringVar(value=self.config['CONNECTION']['port'])
+        ttk.Entry(self.tcp_frame, textvariable=self.port_var).grid(row=1, column=1, padx=5)
+
+        # 設定メニューの追加
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="設定", menu=settings_menu)
+        settings_menu.add_command(label="シリアル通信設定", command=self.open_serial_settings)
+
+        # コマンド入力フレーム
+        input_frame = ttk.LabelFrame(self.root, text="コマンド入力", padding=10)
+        input_frame.pack(padx=10, pady=5, fill="x")
+
+        ttk.Label(input_frame, text="コマンド名:").grid(row=0, column=0, sticky="e")
+        self.command_name_var = tk.StringVar()
+        self.command_name_entry = ttk.Entry(input_frame, textvariable=self.command_name_var)
+        self.command_name_entry.grid(row=0, column=1, padx=5, sticky="ew")
+
+        ttk.Label(input_frame, text="コマンド:").grid(row=1, column=0, sticky="e", pady=5)
+        self.command_text = tk.Text(input_frame, height=2, width=50)  # 高さを5から4に変更
+        self.command_text.grid(row=1, column=1, padx=5, pady=5)
+
+        # 入力フレームのカラム設定
+        input_frame.grid_columnconfigure(1, weight=1)
+
+        # ボタンフレーム（右側に配置）
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.grid(row=0, column=2, rowspan=2, padx=5, sticky="ns")  # 右側に配置
+
+        ttk.Button(btn_frame, text="送信",
+                command=self.send_manual_command).pack(fill="x", pady=2)
+        ttk.Button(btn_frame, text="コマンドを登録",
+                command=self.register_command).pack(fill="x", pady=2)
+
+        # 保存済みコマンドフレーム
+        self.saved_cmd_frame = ttk.LabelFrame(self.root, text="保存済みコマンド", padding=10)
+        self.saved_cmd_frame.pack(padx=10, pady=5, fill="x")
+        self.load_saved_commands()
+
+        # 応答表示エリア
+        response_frame = ttk.LabelFrame(self.root, text="応答", padding=10)
+        response_frame.pack(padx=10, pady=5, fill="both", expand=True)
+        self.response_text = tk.Text(response_frame, height=10, width=50)
+        self.response_text.pack(fill="both", expand=True)
+
+        # ログ関連のボタンフレーム
+        log_frame = ttk.Frame(self.root)
+        log_frame.pack(padx=10, pady=5, fill="x")
+        
+        ttk.Button(log_frame, text="ログを保存",
+                command=self.save_log_to_file).pack(side="left", padx=5)
+        ttk.Button(log_frame, text="応答欄をクリア",
+                command=self.clear_response_area).pack(side="left", padx=5)
+        ttk.Button(log_frame, text="ログファイルを開く",
+                command=self.open_log_file).pack(side="left", padx=5)
+        ttk.Button(log_frame, text="ログディレクトリを開く",
+                command=self.open_log_directory).pack(side="left", padx=5)
+        
+        # データ受信時のクリア設定
+        self.clear_on_receive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(log_frame, text="履歴をクリアしてデータ受信",
+                    variable=self.clear_on_receive_var).pack(side="right", padx=5)
+        
+        # 初期状態の接続フレームを更新（初回表示）
+        self.update_connection_frame()
+
+    def clear_response_area(self):  # レスポンスエリアのクリア
+        self.response_text.delete("1.0", "end")
+
+    def update_connection_frame(self):  # 接続フレームの更新
+        mode = self.mode_var.get()
+
+        if mode == "TCP":
+            if hasattr(self, 'serial_frame') and self.serial_frame.winfo_exists():
+                self.serial_frame.pack_forget()  # シリアル設定フレームを非表示にする
+            self.tcp_frame.pack(fill="x", padx=5, pady=5)
+        elif mode == "SERIAL":
+            self.tcp_frame.pack_forget()  # TCP設定フレームを非表示にする
+            if not hasattr(self, 'serial_frame') or not self.serial_frame.winfo_exists():
+                # serial_frameが存在しないか、すでに破棄されている場合は再作成
+                self.serial_frame = ttk.Frame(self.conn_frame)  # conn_frameを親フレームにする
+                ttk.Label(self.serial_frame, text="COMポート:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+                self.com_port_var = tk.StringVar(value=self.config['CONNECTION']['com_port'])
+                com_ports = [port.device for port in serial.tools.list_ports.comports()]
+                ttk.Combobox(self.serial_frame, textvariable=self.com_port_var, values=com_ports).grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+            self.serial_frame.pack(fill="x", padx=5, pady=5)
+
+    def update_com_ports(self):  # COMポートの更新
+        # 利用可能なCOMポートを取得
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.com_ports_combo['values'] = ports
+        
+        # 現在の選択がない場合は最初のポートを選択
+        if not self.com_port_var.get() or self.com_port_var.get() not in ports:
+            if ports:
+                self.com_port_var.set(ports[0])
+
+    def create_tooltip(self, widget, text):  # ツールチップの作成
+        def show_tooltip(event=None):
+            tooltip = tk.Toplevel()
+            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            tooltip.wm_overrideredirect(True)
+            
+            label = ttk.Label(tooltip, text=text, wraplength=400,
+                            background="#ffffe0", relief="solid", borderwidth=1)
+            label.pack()
+            
+            def hide_tooltip():
+                tooltip.destroy()
+            
+            widget.bind("<Leave>", lambda e: hide_tooltip())
+            tooltip.bind("<Leave>", lambda e: hide_tooltip())
+        
+        widget.bind("<Enter>", show_tooltip)
+
+    """Connection Management"""
+    def toggle_connection(self):  # 接続の切り替え
+        if not self.is_connected:
+            self.connect()
+        else:
+            # 切断前に接続の状態を確認
+            if self.connection is None:
+                self.is_connected = False
+                self.connect_button.configure(text="接続")
+                self.connection_status.configure(text="未接続")
+                return
+            self.disconnect()
+
+    def connect(self):  # 接続の確立
+        try:
+            if self.mode_var.get() == "TCP":
+                self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.connection.settimeout(float(self.config['CONNECTION']['timeout']))
+                self.connection.connect((self.host_var.get(), int(self.port_var.get())))
+            else:
+                self.connection = serial.Serial(
+                    port=self.com_port_var.get(),
+                    baudrate=int(self.baudrate_var.get()),
+                    bytesize=int(self.bytesize_var.get()),
+                    parity=self.get_parity_setting(),
+                    stopbits=float(self.stopbits_var.get()),
+                    timeout=float(self.config['CONNECTION']['timeout'])
+                )
+
+            self.is_connected = True
+            self.connect_button.configure(text="切断")
+            self.connection_status.configure(text="接続中")
+            
+            # 受信スレッド開始
+            self.should_stop.clear()
+            self.receive_thread = threading.Thread(target=self.receive_data)
+            self.receive_thread.daemon = True
+            self.receive_thread.start()
+
+        except Exception as e:
+            messagebox.showerror("接続エラー", str(e))
+            self.disconnect()
+
+    def disconnect(self):  # 接続の切断
+        self.should_stop.set()  # スレッドに停止を通知
+        
+        # メインスレッドから呼ばれた場合のみjoinを実行
+        if threading.current_thread() is threading.main_thread():
+            if self.receive_thread and self.receive_thread.is_alive():
+                self.receive_thread.join(timeout=1.0)
+        
+        if self.connection:
+            try:
+                if self.mode_var.get() == "TCP" and isinstance(self.connection, socket.socket):
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except (socket.error, OSError):
+                        # すでに切断されている場合は無視
+                        pass
+                # どちらのモードでもclose()は呼び出す
+                self.connection.close()
+            except Exception as e:
+                print(f"切断中にエラーが発生: {str(e)}")
+            self.connection = None
+        
+        self.is_connected = False
+        self.connect_button.configure(text="接続")
+        self.connection_status.configure(text="未接続")
+
+    def handle_disconnect(self):  # 切断時の処理
+        self.disconnect()
+
+    """Data Handling"""
+    def receive_data(self):  # データ受信
+        buffer = bytearray()
+        last_receive_time = time.time()
+        DATA_TIMEOUT = 0.5  # データ待機タイムアウト時間（秒）
+        
+        while not self.should_stop.is_set():
+            try:
+                if self.mode_var.get() == "TCP":
+                    # TCPモードでの受信
+                    while not self.should_stop.is_set(): # 停止フラグをチェック
+                        try:
+                            if self.connection is None:
+                                raise ConnectionError("TCP接続が無効です。")
+                            
+                            # ノンブロッキングモードに設定
+                            self.connection.setblocking(0)
+                            ready = select.select([self.connection], [], [], DATA_TIMEOUT)
+                            
+                            if ready[0]:
+                                data = self.connection.recv(1024)
+                                if data:
+                                    buffer.extend(data)
+                                    last_receive_time = time.time()
+                                else:
+                                    # 接続が切断された場合
+                                    raise ConnectionError("Connection closed by remote host")
+                            else:
+                                # タイムアウト時の処理
+                                if buffer and (time.time() - last_receive_time) > DATA_TIMEOUT:
+                                    # Telnetネゴシエーションの処理
+                                    if self.telnet_protocol.IAC in buffer:
+                                        response = self.telnet_protocol.handle_negotiation(bytes(buffer))
+                                        if response:
+                                            self.connection.sendall(response)
+                                        buffer = bytearray(self.telnet_protocol.process_data(bytes(buffer)))
+                                    
+                                    if buffer:  # クリーンなデータがある場合
+                                        self.receive_queue.put(bytes(buffer))
+                                        buffer.clear()
+                                    last_receive_time = time.time()
+                        
+                        except socket.error as e:
+                            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                # データがない場合は待機
+                                if buffer and (time.time() - last_receive_time) > DATA_TIMEOUT:
+                                    if buffer:
+                                        self.receive_queue.put(bytes(buffer))
+                                        buffer.clear()
+                                    last_receive_time = time.time()
+                                continue
+                            else:
+                                raise
+                
+                else:
+                    # シリアルモードでの受信
+                    while True:
+                        # self.connectionがNoneでないかをチェック
+                        if self.connection is not None and self.connection.in_waiting:
+                            data = self.connection.read(self.connection.in_waiting)
+                            if data:
+                                buffer.extend(data)
+                                last_receive_time = time.time()
+                        else:
+                            # 一定時間データが来ない場合はバッファのデータを処理
+                            if buffer and (time.time() - last_receive_time) > DATA_TIMEOUT:
+                                self.receive_queue.put(bytes(buffer))
+                                buffer.clear()
+                                last_receive_time = time.time()
+                            time.sleep(0.1)
+
+            except socket.timeout:
+                # タイムアウト時にバッファにデータがある場合は送信
+                if buffer:
+                    self.receive_queue.put(bytes(buffer))
+                    buffer.clear()
+                continue
+                
+            except AttributeError as e:
+                # 接続がNoneの場合に発生するエラーの処理
+                self.receive_queue.put("受信エラー: 接続が切断されました".encode())
+                self.root.after(0, self.handle_disconnect)
+                break
+
+            except Exception as e:
+                if buffer:
+                    self.receive_queue.put(bytes(buffer))
+                self.receive_queue.put(f"受信エラー: {str(e)}".encode())
+                # エラー発生時は、メインスレッドに切断処理を依頼
+                self.root.after(0, self.handle_disconnect)
+                break
+
+    def check_received_data(self):  # 受信データの確認
+        while not self.receive_queue.empty():
+            data = self.receive_queue.get()
+            
+            try:
+                # 新規データ受信時のクリア処理
+                if self.clear_on_receive_var.get():
+                    self.clear_response_area()
+                
+                # データをデコード
+                decoded_data = data.decode(self.config['CONNECTION']['encoding'], errors='replace')
+                
+                # タイムスタンプを付加
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                formatted_data = f"受信:[{timestamp}]\n{decoded_data}\n{'-'*50}\n"
+                
+                # GUI表示を更新
+                self.response_text.insert("end", formatted_data)
+                self.response_text.see("end")
+                
+            except Exception as e:
+                logging.error(f"データの処理中にエラーが発生: {str(e)}")
+        
+        self.root.after(100, self.check_received_data)
+
+    def check_sample_id(self, data):  # サンプルIDの確認
+        try:
+            self.log_filename = None  # 前回の結果をリセット
+            decoded_data = data.decode(self.config['CONNECTION']['encoding'], errors='replace')
+            normalized_data = unicodedata.normalize('NFKC', decoded_data)
+
+            patterns = [
+                r"Sample\s*ID\t+([^\n\r]+)",
+                r"Sample\s*ID[\s\t]+([^\n\r]+)",
+                r"Sample[\s\t]*ID[\s\t]*([^\n\r]+)",
+                r"^\s*Sample[\s\t]*ID[\s\t]*([^\n\r]+)",
+                r".*Sample[\s\t]*ID[\s\t]*([^\n\r]+)",
+                r"Sample\s*ID\s*\t\s*([^\n\r]+)",
+                r"Sample\s*ID\t([^\n\r]+)"
+            ]
+
+            for pattern in patterns:
+                for line in normalized_data.split('\n'):
+                    match = re.search(pattern, line.strip())
+                    if match:
+                        sample_id = match.group(1).strip()
+                        # 禁止文字と空白をアンダースコアに置換
+                        safe_sample_id = re.sub(r'[\\/*?:"<>|]', '_', sample_id)
+                        safe_sample_id = re.sub(r'[\s\t]+', '_', safe_sample_id)
+
+                        # 'G', 'IP', 'BP'に該当するパターンでサブフォルダを決定
+                        if re.search(r'G\d*$', safe_sample_id):
+                            subfolder = "G"
+                        elif re.search(r'IP\d*$', safe_sample_id):
+                            subfolder = "IP"
+                        elif re.search(r'BP\d*$', safe_sample_id):
+                            subfolder = "BP"
+                        else:
+                            subfolder = "others"  # 該当しない場合はothersフォルダ
+
+                        # サブフォルダのパス作成（存在しなければ作成）
+                        folder_path = os.path.join("logs", subfolder)
+                        if not os.path.exists(folder_path):
+                            os.makedirs(folder_path)
+
+                        # 基本のファイル名を作成
+                        base_filename = f"sample_ID_{safe_sample_id}.log"
+                        log_filename = os.path.join(folder_path, base_filename)
+
+                        # ファイル名の重複チェック（既に存在する場合は連番を付加）
+                        counter = 1
+                        while os.path.exists(log_filename):
+                            name_parts = os.path.splitext(base_filename)
+                            new_filename = f"{name_parts[0]}({counter}){name_parts[1]}"
+                            log_filename = os.path.join(folder_path, new_filename)
+                            counter += 1
+
+                        self.log_filename = log_filename
+
+                        logging.info(f"Sample ID を検出: {sample_id}")
+                        logging.info(f"保存先フォルダ: {subfolder}")
+                        logging.info(f"ログファイル名を設定: {self.log_filename}")
+                        return True
+
+            if not self.log_filename:
+                logging.debug("Sample ID が見つかりませんでした。")
+                logging.debug("データ内容（16進数）:")
+                logging.debug(' '.join(f'{ord(c):02x}' for c in normalized_data))
+                logging.debug("データ内容（通常）:")
+                logging.debug(normalized_data)
+
+            return False
+
+        except Exception as e:
+            logging.error(f"Sample ID の処理中にエラーが発生: {str(e)}")
+            traceback_info = traceback.format_exc()
+            logging.debug(f"詳細なエラー情報:\n{traceback_info}")
+            return False
+
+    def send_command(self, command):  # コマンド送信
+        if not self.is_connected:
+            messagebox.showwarning("警告", "接続されていません。")
+            return
+
+        try:
+            # 改行コードの追加
+            command_with_newline = command.strip() + self.get_newline_bytes().decode()
+            command_bytes = command_with_newline.encode(self.config['CONNECTION']['encoding'])
+            
+            # コマンド送信
+            if self.mode_var.get() == "TCP":
+                self.connection.sendall(command_bytes)
+            else:
+                self.connection.write(command_bytes)
+                self.connection.flush()
+
+            # ログに記録
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            log_entry = f"送信:[{timestamp}]\n{command_with_newline}{'-'*50}\n"
+            
+            # GUIに表示
+            self.response_text.insert("end", log_entry)
+            self.response_text.see("end")
+
+        except Exception as e:
+            error_message = f"コマンド送信エラー: {str(e)}"
+            messagebox.showerror("エラー", error_message)
+            logging.error(error_message)
+
+      # 手動コマンド送信
+
+    def send_manual_command(self):  # 手動コマンド送信
+        command = self.command_text.get("1.0", "end-1c")
+        if command.strip():
+            self.send_command(command)
+
+    def format_response(self, response):  # レスポンスのフォーマット
+        if self.config['RESPONSE']['format'].lower() == 'hex':
+            return ' '.join(f'{b:02X}' for b in response)
+        return response.decode(self.config['CONNECTION']['encoding'], errors='replace')
+
+    def get_parity_setting(self):  # パリティ設定取得
+        parity_map = {
+            'NONE': serial.PARITY_NONE,
+            'EVEN': serial.PARITY_EVEN,
+            'ODD': serial.PARITY_ODD,
+            'MARK': serial.PARITY_MARK,
+            'SPACE': serial.PARITY_SPACE
+        }
+        return parity_map[self.parity_var.get()]
+
+    def get_newline_bytes(self):  # 改行バイトの取得
+        newline = self.newline_var.get()
+        return {
+            'CR': b'\r',
+            'LF': b'\n',
+            'CRLF': b'\r\n'
+        }.get(newline, b'\r\n')
+
+    """Command Management"""
+    def register_command(self):  # コマンドの登録
+        command_name = self.command_name_var.get().strip()
+        command_value = self.command_text.get("1.0", "end-1c").strip()
+        
+        if not command_name or not command_value:
+            messagebox.showerror("エラー", "コマンド名とコマンドを入力してください。")
+            return
+        
+        # 新しいコマンド番号を決定
+        existing_commands = [k.split('.')[0] for k in self.config['COMMANDS'].keys() if k.endswith('.name')]
+        if existing_commands:
+            latest_num = max([int(cmd.replace('command', '')) for cmd in existing_commands])
+            new_cmd_num = latest_num + 1
+        else:
+            new_cmd_num = 1
+        
+        # コマンドを登録
+        cmd_base = f'command{new_cmd_num}'
+        self.config['COMMANDS'][f'{cmd_base}.name'] = command_name
+        self.config['COMMANDS'][f'{cmd_base}.value'] = command_value
+        
+        # 保存してGUIを更新
+        self.save_settings()
+        self.load_saved_commands()
+        
+        # 入力フィールドをクリア
+        self.command_name_var.set("")
+        self.command_text.delete("1.0", "end")
+
+    def delete_command(self, cmd_base):  # コマンドの削除
+        if messagebox.askyesno("確認", "このコマンドを削除してもよろしいですか？"):
+            self.config['COMMANDS'].pop(f'{cmd_base}.name', None)
+            self.config['COMMANDS'].pop(f'{cmd_base}.value', None)
+            self.save_settings()
+            self.load_saved_commands()
+
+    def load_saved_commands(self):  # 保存されたコマンドの読み込み
+        # 既存のボタンをクリア
+        for widget in self.saved_cmd_frame.winfo_children():
+            widget.destroy()
+
+        # 保存済みコマンドのボタンを作成
+        for key, value in self.config['COMMANDS'].items():
+            if key.endswith('.name'):
+                cmd_base = key.split('.')[0]
+                cmd_name = value
+                cmd_value = self.config['COMMANDS'][f'{cmd_base}.value']
+                
+                # コマンドフレームの作成
+                cmd_frame = ttk.Frame(self.saved_cmd_frame)
+                cmd_frame.pack(fill="x", pady=2, padx=5)
+                
+                # 左側のボタン部分
+                btn_frame = ttk.Frame(cmd_frame)
+                btn_frame.pack(side="left", padx=(0, 10))
+                
+                ttk.Button(btn_frame, text=cmd_name,
+                          command=lambda cv=cmd_value: self.send_command(cv)).pack(side="left", padx=2)
+                
+                ttk.Button(btn_frame, text="削除",
+                          command=lambda cb=cmd_base: self.delete_command(cb)).pack(side="left", padx=2)
+                
+                # コマンド内容表示部分
+                cmd_display = ttk.Label(cmd_frame, 
+                                      text=cmd_value[:50] + "..." if len(cmd_value) > 50 else cmd_value,
+                                      wraplength=400)
+                cmd_display.pack(side="left", fill="x", expand=True)
+                
+                # ツールチップの設定
+                self.create_tooltip(cmd_display, cmd_value)
+
+    """Application Control"""
+    def on_closing(self):
+        self.should_stop.set()  # スレッドに停止を通知
+        if self.receive_thread and self.receive_thread.is_alive():
+            self.receive_thread.join(timeout=1.0)
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TCPSerialCommandSender(root)
+    root.mainloop()
